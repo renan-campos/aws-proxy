@@ -1,0 +1,54 @@
+---
+# AWS access and secret keys configuration can be configured in `vault.yml`
+# file encripted via ansible-vault
+#aws_access_key: "..."
+#aws_secret_key: "..."
+
+# name of the created proxy server instance
+aws_instance_name: "proxy-server"
+
+# Configuration required for proxy server installation and configuration
+# user and password for accessing the proxy from clients
+proxy_user: "client"
+proxy_password: "S0meP4ssw0rd"
+
+# allow_access_cidr_ips contains list of IPs/subnets which will be allowed to
+# access the http proxy server
+# if you want to allow access from anywhere, uncomment the `0.0.0.0/0` (and
+# comment out the rest of the lines)
+allow_access_cidr_ips:
+  # allow access from anywhere
+  - "0.0.0.0/0"
+
+# Name of ssh key used to create and access the instance
+aws_key: "my-key"
+
+# path to private key for the aws_key
+private_key_file: "~/.ssh/my-key.pem"
+
+aws_instance_type: "t2.micro"
+
+
+# Region specific configuration
+# (uncoment/update the section for particular region)
+## us-east-1 ############################
+aws_region: "us-east-1"
+# VPC and public and private subnet
+aws_vpc: "vpc-0e8f8a6a9f8265efc"
+public_subnet: "subnet-0ac69d699404fde4f"
+private_subnet: "subnet-043c8439fc00fbec6"
+
+# the installation was tested for Amazon Linux 2, but it might similarly work
+# for any RHEL based distro
+# Amazon Linux 2 AMI (HVM) - Kernel 5.10, SSD Volume Type
+aws_ami: "ami-0022f774911c1d690"
+
+## us-east-2 ############################
+#aws_region: "us-east-2"
+## VPC and public and private subnet
+#aws_vpc: "vpc-0360e15dd18b6a3c2"
+#public_subnet: "subnet-05e4b6e480c2c01cb"
+#private_subnet: "subnet-099a27f19ddea5855"
+#
+## Amazon Linux 2 AMI (HVM) - Kernel 5.10, SSD Volume Type
+#aws_ami: "ami-0fa49cc9dc8d62c84"

@@ -1,0 +1,377 @@
+---
+- name: "Play for creating or cleaning up the EC2 instance for proxy server"
+  hosts: "localhost"
+  vars:
+    # if no action is specified (empty string or anything else) only
+    # installation and configuration part of this playbook (next play) is
+    # performed
+    _action: ""
+    #_action: "create"
+    #_action: "destroy"
+  vars_files:
+    - "configuration.yml"
+    - "vault.yml"
+
+  tasks:
+    # Security group creation
+    - name: Prepare ssh rule for aws-proxy-* security group
+      set_fact:
+        group_rules: "{{ [{'proto': 'tcp', 'from_port': 22, 'to_port': 22, 'cidr_ip': '0.0.0.0/0'}] }}"
+      when: _action == "create"
+
+    - name: "Prepare list of rules for aws-proxy-* security group (restricted to allowed IPs)"
+      set_fact:
+        group_rules: "{{ group_rules  + [{'proto': 'tcp', 'from_port': 3128, 'to_port': 3129, 'cidr_ip': item}] }}"
+      loop: "{{ allow_access_cidr_ips }}"
+      when: _action == "create"
+
+    - name: "DEBUG: Security Group Rules"
+      debug:
+        var: group_rules
+        verbosity: 1
+
+    - name: create aws-proxy-* security group
+      amazon.aws.ec2_group:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        name: "{{ aws_instance_name }}-security-group"
+        description: Security group for {{ aws_instance_name }} server
+        vpc_id: "{{ aws_vpc }}"
+        rules: "{{ group_rules }}"
+        state: present
+      register: ec2_group
+      when: _action == "create"
+
+    - name: "DEBUG: Creted Security Group"
+      debug:
+        var: ec2_group
+        verbosity: 1
+
+    # Gather information about existing EC2 instance with the same name
+    # (this is used when the playbook is executed repeatedly)
+    - name: gather info about EC2 instance if exists
+      amazon.aws.ec2_instance_info:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        filters:
+          "tag:Name": "{{ aws_instance_name }}"
+      register: ec2_instance_existing
+      when: _action == "create"
+
+    - name: "DEBUG: Information about existing EC2 instance"
+      debug:
+        var: ec2_instance_existing
+        verbosity: 1
+
+    # EC2 instance creation (if not present)
+    - name: create and start AWS EC2 instance
+      amazon.aws.ec2_instance:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        name: "{{ aws_instance_name }}"
+        key_name: "{{ aws_key }}"
+        instance_type: "{{ aws_instance_type }}"
+        network:
+          subnet_id: "{{ public_subnet }}"
+          assign_public_ip: true
+          delete_on_termination: yes
+          groups: ["{{ ec2_group.group_id }}"]
+          description: "{{ aws_instance_name }}-public-interface"
+        image_id: "{{ aws_ami }}"
+        security_group: "{{ ec2_group.group_id }}"
+        vpc_subnet_id: "{{ public_subnet }}"
+        wait: yes
+        state: started
+      register: ec2_instance
+      when:
+        - _action == "create"
+        - ec2_instance_existing.instances | length == 0
+
+    - name: "DEBUG: Created EC2 instance"
+      debug:
+        var: ec2_instance
+        verbosity: 1
+
+    # If ec2 instance already exists, set the ec2_instance variable to the
+    # existing one to have it for further usage
+    - name: Set ec2_instance variable to the existing instance
+      set_fact:
+        ec2_instance: "{{ ec2_instance_existing }}"
+      when:
+        - _action == "create"
+        - ec2_instance_existing.instances | length != 0
+
+    - name: Create private interface
+      amazon.aws.ec2_eni:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        name: "{{ aws_instance_name }}-privatelink-interface"
+        description: "{{ aws_instance_name }}-privatelink-interface"
+        # directly attaching the device doesn't work:
+        # https://github.com/ansible-collections/amazon.aws/issues/870
+        #instance_id: "{{ ec2_instance.instances[0].instance_id }}"
+        #device_index: 1
+        security_groups: ["{{ ec2_group.group_id }}"]
+        subnet_id: "{{ private_subnet }}"
+        state: present
+      register: private_eni
+      when: _action == "create"
+
+    - name: "DEBUG: Created Private interface"
+      debug:
+        var: private_eni
+        verbosity: 1
+
+    # Add the second (private) interface to the ec2 instance
+    - name: add second (private) interface
+      amazon.aws.ec2_instance:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        name: "{{ aws_instance_name }}"
+        network:
+          interfaces:
+            # we have to define also the first existing one here
+            - id: "{{ ec2_instance.instances[0].network_interfaces[0].network_interface_id }}"
+            - id: "{{ private_eni.interface.id }}"
+          delete_on_termination: yes
+          groups: ["{{ ec2_group.group_id }}"]
+      register: ec2_instance
+      when: _action == "create"
+
+    # configure the newly added interface to be deleted on termination
+    - name: modify the second interface to delete it on termination
+      amazon.aws.ec2_eni:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        eni_id: "{{ private_eni.interface.id }}"
+        delete_on_termination: true
+      when: _action == "create"
+
+    - name: "DEBUG: Updated EC2 instance"
+      debug:
+        var: ec2_instance
+        verbosity: 1
+
+    - name: Public DNS Name
+      debug:
+        msg: "Public DNS Name: {{ ec2_instance.instances[0].public_dns_name }}"
+      when:
+        - ec2_instance.instances is defined
+        - ec2_instance.instances
+
+    - name: Public IP Address
+      debug:
+        msg: "Public IP Address: {{ ec2_instance.instances[0].public_ip_address }}"
+      when:
+        - ec2_instance.instances is defined
+        - ec2_instance.instances
+
+    # TODO: it might be worth to set custom (known) DNS record for the proxy
+    # server, but it doesn't work for some reason (the record is created, but
+    # is not available)
+    #- name: crete DNS record for the instance
+    #  community.aws.route53:
+    #    aws_access_key: "{{ aws_access_key }}"
+    #    aws_secret_key: "{{ aws_secret_key }}"
+    #    #region: "{{ aws_region }}"
+    #    state: present
+    #    zone: "{{ dns_zone }}"
+    #    record: "{{ aws_instance_name }}.{{ dns_zone }}"
+    #    type: A
+    #    ttl: 600
+    #    value: "{{ ec2_instance.instances[0].public_ip_address }}"
+    #    overwrite: yes
+    #    wait: yes
+    #  register: dns_record
+    #  when: _action == "create"
+
+    #- name: "DEBUG: Created DNS Record"
+    #  debug:
+    #    var: dns_record
+    #    verbosity: 1
+
+    # Add the newly created instance to inventory to be able to continue with
+    # the next play for installing and configuring Squid proxy
+    - name: Add the created proxy server to inventory
+      add_host:
+        # if previous task (adding custom DNS record) will be fixed, we can use
+        # that known name here:
+        # hostname: "{{ aws_instance_name }}.{{ dns_zone }}"
+        hostname: "{{ ec2_instance.instances[0].public_dns_name }}"
+        groups:
+        - proxy_server
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no"
+        ansible_user: "ec2-user"
+        ansible_ssh_private_key_file: "{{ private_key_file }}"
+      when:
+        - ec2_instance.instances is defined
+        - ec2_instance.instances
+
+
+    # ------------------------------------------------------------------------
+    # Following tasks should destroy the existing proxy server and all related
+    # resources if needed
+
+    # creation of custom DNS record doesn't work, see the note above
+    #- name: Retrieve the details for DNS record
+    #  community.aws.route53:
+    #    aws_access_key: "{{ aws_access_key }}"
+    #    aws_secret_key: "{{ aws_secret_key }}"
+    #    #region: "{{ aws_region }}"
+    #    state: get
+    #    zone: "{{ dns_zone }}"
+    #    record: "{{ aws_instance_name }}.{{ dns_zone }}"
+    #    type: "A"
+    #  register: dns_record
+    #  when: _action == "destroy"
+
+    #- debug:
+    #    var: dns_record
+    #    verbosity: 1
+
+    #- name: Delete the DNS record
+    #  community.aws.route53:
+    #    aws_access_key: "{{ aws_access_key }}"
+    #    aws_secret_key: "{{ aws_secret_key }}"
+    #    #region: "{{ aws_region }}"
+    #    state: absent
+    #    zone: s1.devshift.org
+    #    record: "{{ dns_record.set.record }}"
+    #    #ttl: "{{ dns_record.set.ttl }}"
+    #    type: "A"
+    #    value: "{{ dns_record.set.value }}"
+    #  when: _action == "destroy"
+
+    - name: terminate AWS EC2 instance
+      amazon.aws.ec2_instance:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        name: "{{ aws_instance_name }}"
+        filters:
+          tag:Name: "{{ aws_instance_name }}"
+        state: absent
+      when: _action == "destroy"
+
+
+    - name: get information about public eni
+      amazon.aws.ec2_eni_info:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        filters:
+          tag:Name: "{{ aws_instance_name }}-public-interface"
+      register: public_eni_info
+      when: _action == "destroy"
+
+    - name: get information about private eni
+      amazon.aws.ec2_eni_info:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        filters:
+          tag:Name: "{{ aws_instance_name }}-privatelink-interface"
+      register: private_eni_info
+      when: _action == "destroy"
+
+    - debug: var=public_eni_info
+    - debug: var=private_eni_info
+
+    - name: delete network interfaces
+      amazon.aws.ec2_eni:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        eni_id: "{{ item.network_interfaces[0].id }}"
+        force_detach: true
+        state: absent
+      loop:
+        - "{{ public_eni_info }}"
+        - "{{ private_eni_info }}"
+      when:
+        - _action == "destroy"
+        - item.network_interfaces[0].id is defined
+
+    - name: delete aws-proxy security group
+      amazon.aws.ec2_group:
+        aws_access_key: "{{ aws_access_key }}"
+        aws_secret_key: "{{ aws_secret_key }}"
+        region: "{{ aws_region }}"
+        name: "{{ aws_instance_name }}-security-group"
+        state: absent
+      when: _action == "destroy"
+    # ------------------------------------------------------------------------
+
+
+# ############################################################################
+# play for installing and configuring Squid proxy server
+- name: "Install and configure Squid proxy server"
+  hosts: "proxy_server"
+  become: yes
+  vars_files:
+    - "configuration.yml"
+    - "vault.yml"
+
+  tasks:
+    - name: update all packages
+      package:
+        name: "*"
+        state: latest
+
+    - name: Install required packages
+      package:
+        name:
+          - "squid"
+          - "httpd-tools"
+        state: latest
+
+    # passlib is not available as rpm for python3 on the Amazon Linux 2
+    - name: "Install passlib (required for htpasswd module)"
+      pip:
+        name: passlib
+
+    - name: Configure password for accessing proxy server
+      community.general.htpasswd:
+        path: "/etc/squid/htpasswd"
+        name: "client"
+        password: "{{ proxy_password }}"
+        owner: root
+        group: squid
+        mode: 0640
+
+    - name: Configure squid
+      lineinfile:
+        dest: "/etc/squid/squid.conf"
+        insertbefore: "BOF"
+        line: "{{ item }}"
+        state: present
+      loop:
+        # This lines have to be in reverse order in the file, but since it is
+        # each is added on the beginning of the file, they will be reversed
+        - "http_access allow proxy_users"
+        - "acl proxy_users proxy_auth {{ proxy_user }}"
+        - "auth_param basic realm proxy"
+        - "auth_param basic program /usr/lib64/squid/basic_ncsa_auth /etc/squid/htpasswd"
+
+    - name: "Enable and start squid service"
+      systemd:
+        name: squid.service
+        state: started
+        enabled: yes
+
+    - name: Reboot the server
+      reboot:
+        reboot_timeout: 600
+
+    - name: Client proxy configuration
+      debug:
+        msg:
+          - "# http://{{ proxy_user }}:{{ proxy_password }}@{{ inventory_hostname }}:3128"
+          - "export http_proxy=http://{{ proxy_user }}:{{ proxy_password }}@{{ inventory_hostname }}:3128"
+          - "export https_proxy=http://{{ proxy_user }}:{{ proxy_password }}@{{ inventory_hostname }}:3128"
